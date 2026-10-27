@@ -402,11 +402,13 @@ class App(tk.Tk):
                                          "업데이트 서버(GitHub 저장소)가 아직 설정되지 않았습니다.")
             return
 
+        events = self.events  # 작업 스레드가 창(self)을 붙잡지 않게 큐만 넘긴다
+
         def run():
             try:
-                self.events.put(("update", update.check(), silent))
+                events.put(("update", update.check(), silent))
             except update.UpdateError as e:
-                self.events.put(("update_error", str(e), silent))
+                events.put(("update_error", str(e), silent))
         threading.Thread(target=run, daemon=True).start()
 
     def _on_update_result(self, info, silent):
@@ -426,15 +428,17 @@ class App(tk.Tk):
         self.status.set(label)
         self.prog["value"] = 0
 
+        events = self.events  # 작업 스레드가 창(self)을 붙잡지 않게 큐만 넘긴다
+
         def progress(done, total, name):
-            self.events.put(("progress", done, total, name))
+            events.put(("progress", done, total, name))
 
         def run():
             try:
                 msg, extra = job(progress)
-                self.events.put(("done", msg, extra))
+                events.put(("done", msg, extra))
             except Exception as e:  # 작업 스레드 오류를 UI로 전달
-                self.events.put(("error", str(e)))
+                events.put(("error", str(e)))
         threading.Thread(target=run, daemon=True).start()
 
     def _poll(self):
