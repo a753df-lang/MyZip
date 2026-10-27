@@ -76,89 +76,102 @@ class _Entry:
 
 
 def create_zip(items, out_path, level=6, progress=None):
-    """items: [(실제 경로, 압축 내부 이름)] — 폴더는 이름이 '/'로 끝남."""
-    total = len(items)
+    """items: [(실제 경로, 압축 내부 이름)] — 폴더는 이름이 '/'로 끝남.
+    progress: myzip.progress.Progress (begin은 호출하는 쪽에서 한다)."""
     entries = []
-    pending = deque()  # 순서대로 쓸 작업: ("hdr", e) / ("data", e, future|bytes) / ("end", e, n, arc)
+    with open(out_path, "wb", buffering=1 << 20) as out, ThreadPoolExecutor(WORKERS) as pool:
+        try:
+            _write_entries(items, level, progress, out, pool, entries)
+        except BaseException:
+            pool.shutdown(wait=True, cancel_futures=True)  # 취소하면 남은 압축 작업은 버린다
+            raise
+        _write_central(out, entries)
+    return len(items)
+
+
+def _write_entries(items, level, progress, out, pool, entries):
+    # 순서대로 쓸 작업: ("hdr", e) / ("small", e, future) / ("data", e, future|bytes, 원본 크기) / ("end", e, arc)
+    pending = deque()
     window = WORKERS * 8
 
-    with open(out_path, "wb", buffering=1 << 20) as out, ThreadPoolExecutor(WORKERS) as pool:
+    def flush(limit):
+        while len(pending) > limit:
+            job = pending.popleft()
+            kind, e = job[0], job[1]
+            if kind == "hdr":
+                e.offset = out.tell()
+                out.write(_local_header(e))
+            elif kind == "small":  # 작은 파일: 결과를 받은 뒤 방식/CRC가 확정됨
+                e.method, data, e.crc, e.usize = job[2].result()
+                e.offset = out.tell()
+                out.write(_local_header(e))
+                out.write(data)
+                e.csize = len(data)
+                if progress:
+                    progress.advance(e.usize)
+            elif kind == "data":
+                data = job[2] if isinstance(job[2], bytes) else job[2].result()
+                out.write(data)
+                e.csize += len(data)
+                if progress:
+                    progress.advance(job[3])
+            else:  # "end": 헤더의 CRC/크기를 실제 값으로 고쳐 쓴다
+                if not e.zip64 and e.csize > U32:
+                    raise OSError(f"압축 결과가 너무 큽니다: {job[2]}")
+                end = out.tell()
+                out.seek(e.offset + 14)
+                if e.zip64:
+                    out.write(struct.pack("<I", e.crc))
+                    out.seek(e.offset + 30 + len(e.name) + 4)
+                    out.write(struct.pack("<QQ", e.usize, e.csize))
+                else:
+                    out.write(struct.pack("<III", e.crc, e.csize, e.usize))
+                out.seek(end)
+                if progress:
+                    progress.item_done(job[2])
 
-        def flush(limit):
-            while len(pending) > limit:
-                job = pending.popleft()
-                kind, e = job[0], job[1]
-                if kind == "hdr":
-                    e.offset = out.tell()
-                    out.write(_local_header(e))
-                elif kind == "small":  # 작은 파일: 결과를 받은 뒤 방식/CRC가 확정됨
-                    e.method, data, e.crc, e.usize = job[2].result()
-                    e.offset = out.tell()
-                    out.write(_local_header(e))
-                    out.write(data)
-                    e.csize = len(data)
-                elif kind == "data":
-                    data = job[2] if isinstance(job[2], bytes) else job[2].result()
-                    out.write(data)
-                    e.csize += len(data)
-                else:  # "end": 헤더의 CRC/크기를 실제 값으로 고쳐 쓴다
-                    if not e.zip64 and e.csize > U32:
-                        raise OSError(f"압축 결과가 너무 큽니다: {job[3]}")
-                    end = out.tell()
-                    out.seek(e.offset + 14)
-                    if e.zip64:
-                        out.write(struct.pack("<I", e.crc))
-                        out.seek(e.offset + 30 + len(e.name) + 4)
-                        out.write(struct.pack("<QQ", e.usize, e.csize))
+    for path, arc in items:
+        st = os.stat(path)
+        is_dir = arc.endswith("/")
+        usize = 0 if is_dir else st.st_size
+        store = is_dir or level == 0 or os.path.splitext(arc)[1].lower() in STORE_EXT
+        e = _Entry(arc, zipfile.ZIP_STORED if store else zipfile.ZIP_DEFLATED,
+                   st.st_mtime, usize, is_dir)
+        entries.append(e)
+        small = not is_dir and usize <= SMALL
+        if small:
+            pending.append(("small", e, pool.submit(_pack_small, path, level, store)))
+        else:
+            pending.append(("hdr", e))
+        if not is_dir and not small:
+            crc = 0
+            read = 0
+            prev_tail = None
+            with open(path, "rb", buffering=0) as f:
+                chunk = f.read(CHUNK)
+                while True:
+                    nxt = f.read(CHUNK) if len(chunk) == CHUNK else b""
+                    last = not nxt
+                    crc = zlib.crc32(chunk, crc)
+                    read += len(chunk)
+                    if store:
+                        pending.append(("data", e, chunk, len(chunk)))
                     else:
-                        out.write(struct.pack("<III", e.crc, e.csize, e.usize))
-                    out.seek(end)
-                    if progress:
-                        progress(job[2], total, job[3])
-
-        for n, (path, arc) in enumerate(items, 1):
-            st = os.stat(path)
-            is_dir = arc.endswith("/")
-            usize = 0 if is_dir else st.st_size
-            store = is_dir or level == 0 or os.path.splitext(arc)[1].lower() in STORE_EXT
-            e = _Entry(arc, zipfile.ZIP_STORED if store else zipfile.ZIP_DEFLATED,
-                       st.st_mtime, usize, is_dir)
-            entries.append(e)
-            small = not is_dir and usize <= SMALL
-            if small:
-                pending.append(("small", e, pool.submit(_pack_small, path, level, store)))
-            else:
-                pending.append(("hdr", e))
-            if not is_dir and not small:
-                crc = 0
-                read = 0
-                prev_tail = None
-                with open(path, "rb", buffering=0) as f:
-                    chunk = f.read(CHUNK)
-                    while True:
-                        nxt = f.read(CHUNK) if len(chunk) == CHUNK else b""
-                        last = not nxt
-                        crc = zlib.crc32(chunk, crc)
-                        read += len(chunk)
-                        if store:
-                            pending.append(("data", e, chunk))
-                        else:
-                            pending.append(("data", e, pool.submit(_deflate, chunk, level, prev_tail, last)))
-                            prev_tail = chunk[-32768:] if chunk else None
-                        flush(window)
-                        if last:
-                            break
-                        chunk = nxt
-                e.crc = crc & U32
-                # 압축 도중 파일 크기가 바뀌었을 수 있으므로 실제 읽은 크기를 기록
-                if read >= ZIP64_THRESHOLD and not e.zip64:
-                    raise OSError(f"압축 중에 파일이 커졌습니다: {arc}")
-                e.usize = read
-            pending.append(("end", e, n, arc))
-            flush(window)
-        flush(0)
-        _write_central(out, entries)
-    return total
+                        pending.append(("data", e, pool.submit(_deflate, chunk, level, prev_tail, last),
+                                        len(chunk)))
+                        prev_tail = chunk[-32768:] if chunk else None
+                    flush(window)
+                    if last:
+                        break
+                    chunk = nxt
+            e.crc = crc & U32
+            # 압축 도중 파일 크기가 바뀌었을 수 있으므로 실제 읽은 크기를 기록
+            if read >= ZIP64_THRESHOLD and not e.zip64:
+                raise OSError(f"압축 중에 파일이 커졌습니다: {arc}")
+            e.usize = read
+        pending.append(("end", e, arc))
+        flush(window)
+    flush(0)
 
 
 def _local_header(e):
@@ -267,10 +280,20 @@ class _Readers:
             if not raw:
                 raise zipfile.BadZipFile(f"파일이 잘렸습니다: {info.filename}")
             left -= len(raw)
-            out = d.decompress(raw) if d else raw
-            if out:
-                crc = zlib.crc32(out, crc)
-                yield out
+            if not d:
+                crc = zlib.crc32(raw, crc)
+                yield raw
+                continue
+            # 잘 압축된 데이터는 4MB가 수백 MB로 풀릴 수 있으므로 한 번에 CHUNK씩만 꺼낸다
+            buf = raw
+            while True:
+                out = d.decompress(buf, CHUNK)
+                buf = d.unconsumed_tail
+                if out:
+                    crc = zlib.crc32(out, crc)
+                    yield out
+                if not buf and len(out) < CHUNK:
+                    break
         if d:
             tail = d.flush()
             if tail:
@@ -284,7 +307,20 @@ class _Readers:
             h.close()
 
 
+def _run_all(work, items, on_result):
+    """items를 모든 코어에서 처리. 취소/오류가 나면 아직 시작하지 않은 작업은 버린다."""
+    pool = ThreadPoolExecutor(WORKERS)
+    try:
+        for fut in as_completed([pool.submit(work, i) for i in items]):
+            on_result(fut.result())
+    except BaseException:
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)
+
+
 def extract_zip(path, dest, infos, safe_target, progress=None):
+    """progress: myzip.progress.Progress (처리한 바이트, 취소, 일시 정지)."""
     # 폴더를 먼저 모두 만들어 두면 스레드끼리 makedirs 경쟁이 생기지 않는다
     targets = {}
     for info in infos:
@@ -292,24 +328,32 @@ def extract_zip(path, dest, infos, safe_target, progress=None):
         targets[info.filename] = target
         os.makedirs(target if info.is_dir() else os.path.dirname(target), exist_ok=True)
     files = sorted((i for i in infos if not i.is_dir()), key=lambda i: -i.file_size)
+    if progress:
+        progress.begin(sum(i.file_size for i in files), len(files))
     readers = _Readers(path)
 
     def work(info):
+        if progress:
+            progress.advance(0)  # 취소했으면 파일을 만들기 전에 멈춘다
         target = targets[info.filename]
-        with open(target, "wb", buffering=0) as dst:
-            for buf in readers.chunks(info):
-                dst.write(buf)
+        try:
+            with open(target, "wb", buffering=0) as dst:
+                for buf in readers.chunks(info):
+                    dst.write(buf)
+                    if progress:
+                        progress.advance(len(buf))
+        except BaseException:
+            try:  # 쓰다 만 파일은 지운다
+                os.remove(target)
+            except OSError:
+                pass
+            raise
         mtime = time.mktime(info.date_time + (0, 0, -1))
         os.utime(target, (mtime, mtime))
         return info.filename
 
     try:
-        with ThreadPoolExecutor(WORKERS) as pool:
-            futures = [pool.submit(work, i) for i in files]
-            for n, fut in enumerate(as_completed(futures), 1):
-                name = fut.result()
-                if progress:
-                    progress(n, len(futures), name)
+        _run_all(work, files, progress.item_done if progress else lambda name: None)
     finally:
         readers.close()
     return len(infos)
@@ -319,25 +363,29 @@ def test_zip(path, progress=None):
     readers = _Readers(path)
     with open_zip(path) as zf:
         infos = [i for i in infolist(zf) if not i.is_dir()]
+    if progress:
+        progress.begin(sum(i.file_size for i in infos), len(infos))
 
     def work(info):
         try:
-            for _ in readers.chunks(info):
-                pass
+            for buf in readers.chunks(info):
+                if progress:
+                    progress.advance(len(buf))
             return info.filename, True
         except (zipfile.BadZipFile, zlib.error, OSError, EOFError):
             return info.filename, False
 
     bad = []
+
+    def on_result(result):
+        name, ok = result
+        if not ok:
+            bad.append(name)
+        if progress:
+            progress.item_done(name)
+
     try:
-        with ThreadPoolExecutor(WORKERS) as pool:
-            futures = [pool.submit(work, i) for i in sorted(infos, key=lambda i: -i.file_size)]
-            for n, fut in enumerate(as_completed(futures), 1):
-                name, ok = fut.result()
-                if not ok:
-                    bad.append(name)
-                if progress:
-                    progress(n, len(futures), name)
+        _run_all(work, sorted(infos, key=lambda i: -i.file_size), on_result)
     finally:
         readers.close()
     return bad

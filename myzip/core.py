@@ -92,7 +92,7 @@ def _safe_target(dest: str, name: str) -> str:
 
 
 def extract(path: str, dest: str, members: list[str] | None = None, progress=None) -> int:
-    """압축 해제. members가 None이면 전체. progress(done, total, name) 콜백. 해제한 항목 수 반환."""
+    """압축 해제. members가 None이면 전체. progress: myzip.progress.Progress. 해제한 항목 수 반환."""
     os.makedirs(dest, exist_ok=True)
     kind = detect_kind(path)
     wanted = set(members) if members else None
@@ -105,12 +105,15 @@ def extract(path: str, dest: str, members: list[str] | None = None, progress=Non
         with tarfile.open(path) as tf:
             mems = [m for m in tf.getmembers()
                     if wanted is None or _selected(m.name + ("/" if m.isdir() else ""), wanted)]
-            for n, m in enumerate(mems, 1):
+            if progress:
+                progress.begin(sum(m.size for m in mems if m.isfile()), len(mems))
+            for m in mems:
                 _safe_target(dest, m.name)
                 tf.extract(m, dest, filter="data")
                 count += 1
                 if progress:
-                    progress(n, len(mems), m.name)
+                    progress.advance(m.size if m.isfile() else 0)
+                    progress.item_done(m.name)
     return count
 
 
@@ -182,13 +185,31 @@ def _walk_sources(sources: list[str]):
 
 
 def create(sources: list[str], out_path: str, fmt: str = "zip", level: int = 6, progress=None) -> int:
-    """압축 파일 생성. level: 0(저장)~9(최고). 추가한 항목 수 반환."""
+    """압축 파일 생성. level: 0(저장)~9(최고). progress: myzip.progress.Progress. 추가한 항목 수 반환.
+
+    취소하거나 오류가 나면 만들다 만 압축 파일은 지운다."""
     if fmt not in FORMATS:
         raise ArchiveError(f"알 수 없는 형식: {fmt}")
     items = list(_walk_sources(sources))
     out_abs = os.path.abspath(out_path)
     items = [(p, a) for p, a in items if os.path.abspath(p) != out_abs]
-    total = len(items)
+    if progress:
+        progress.begin(sum(os.path.getsize(p) for p, a in items if not a.endswith("/")), len(items))
+    try:
+        return _create(items, out_path, fmt, level, progress)
+    except BaseException:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        raise
+
+
+def _create(items, out_path, fmt, level, progress):
+    def done(path, arc):
+        if progress:
+            progress.advance(0 if arc.endswith("/") else os.path.getsize(path))
+            progress.item_done(arc)
 
     if fmt == "zip":
         # 기본 ZIP(Deflate)은 멀티코어 엔진 사용
@@ -199,10 +220,9 @@ def create(sources: list[str], out_path: str, fmt: str = "zip", level: int = 6, 
         if method in (zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2):
             kw["compresslevel"] = max(1, level) if method == zipfile.ZIP_BZIP2 else level
         with zipfile.ZipFile(out_path, "w", compression=method, **kw) as zf:
-            for n, (path, arc) in enumerate(items, 1):
+            for path, arc in items:
                 zf.write(path, arc)
-                if progress:
-                    progress(n, total, arc)
+                done(path, arc)
     else:
         mode = TAR_MODES[fmt]
         kw = {}
@@ -211,11 +231,10 @@ def create(sources: list[str], out_path: str, fmt: str = "zip", level: int = 6, 
         elif fmt == "tar.xz":
             kw["preset"] = min(level, 9)
         with tarfile.open(out_path, mode, **kw) as tf:
-            for n, (path, arc) in enumerate(items, 1):
+            for path, arc in items:
                 tf.add(path, arc.rstrip("/"), recursive=False)
-                if progress:
-                    progress(n, total, arc)
-    return total
+                done(path, arc)
+    return len(items)
 
 
 def test(path: str, progress=None) -> list[str]:
@@ -228,13 +247,16 @@ def test(path: str, progress=None) -> list[str]:
         try:
             with tarfile.open(path) as tf:
                 mems = tf.getmembers()
-                for n, m in enumerate(mems, 1):
+                if progress:
+                    progress.begin(sum(m.size for m in mems if m.isfile()), len(mems))
+                for m in mems:
                     if m.isfile():
                         f = tf.extractfile(m)
-                        while f.read(1 << 20):
-                            pass
+                        while buf := f.read(1 << 20):
+                            if progress:
+                                progress.advance(len(buf))
                     if progress:
-                        progress(n, len(mems), m.name)
+                        progress.item_done(m.name)
         except (tarfile.TarError, OSError, EOFError) as e:
             bad.append(str(e))
     return bad

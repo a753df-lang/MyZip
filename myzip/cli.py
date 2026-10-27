@@ -10,15 +10,26 @@ import os
 import sys
 
 from . import __version__, core
+from .progress import Progress
 
 
-def _bar(done, total, name):
-    width = 30
-    filled = width * done // max(total, 1)
-    sys.stdout.write(f"\r[{'#' * filled}{'.' * (width - filled)}] {done}/{total} {name[:40]:<40}")
-    sys.stdout.flush()
-    if done == total:
-        sys.stdout.write("\n")
+class _Bar(Progress):
+    """명령줄 진행 막대: [#####.....] 45%  120.0 MB/s  남은 시간 0:12  파일이름"""
+
+    def item_done(self, name):
+        super().item_done(name)
+        width = 30
+        frac = self.done_bytes / self.total_bytes if self.total_bytes else self.done_items / max(self.total_items, 1)
+        filled = int(width * frac)
+        secs = max(self.elapsed(), 1e-6)
+        speed = self.done_bytes / secs
+        left = (self.total_bytes - self.done_bytes) / speed if speed else 0
+        sys.stdout.write(f"\r[{'#' * filled}{'.' * (width - filled)}] {frac * 100:3.0f}%  "
+                         f"{core.human_size(int(speed))}/s  남은 시간 {int(left) // 60}:{int(left) % 60:02d}  "
+                         f"{name[:30]:<30}")
+        sys.stdout.flush()
+        if self.done_items == self.total_items:
+            sys.stdout.write("\n")
 
 
 def main(argv=None):
@@ -44,14 +55,14 @@ def main(argv=None):
     try:
         if a.cmd == "c":
             fmt = a.format or _guess_format(a.archive)
-            n = core.create(a.sources, a.archive, fmt, a.level, _bar)
+            n = core.create(a.sources, a.archive, fmt, a.level, _Bar())
             print(f"{n}개 항목 압축 완료 → {a.archive} ({core.human_size(os.path.getsize(a.archive))})")
         elif a.cmd == "x":
             if a.same:
                 out = os.path.dirname(os.path.abspath(a.archive))
             else:
                 out = a.out or core.name_folder_dest(a.archive)
-            n = core.extract(a.archive, out, progress=_bar)
+            n = core.extract(a.archive, out, progress=_Bar())
             print(f"{n}개 항목 해제 완료 → {out}")
         elif a.cmd == "l":
             entries = core.list_entries(a.archive)
@@ -61,7 +72,7 @@ def main(argv=None):
                 print(f"{e.size:>12,} {e.packed:>12,} {e.ratio:>5.1f}%  {when:<19}  {e.name}")
             print(f"총 {len(entries)}개 항목")
         elif a.cmd == "t":
-            bad = core.test(a.archive, _bar)
+            bad = core.test(a.archive, _Bar())
             if bad:
                 print("손상된 항목:", *bad, sep="\n  ")
                 return 1

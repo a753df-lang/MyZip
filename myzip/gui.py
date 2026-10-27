@@ -6,9 +6,11 @@ import sys
 import threading
 import tkinter as tk
 import webbrowser
+from collections import deque
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__, core, update
+from .progress import Cancelled, Progress
 
 APP = "MyZip"
 
@@ -122,6 +124,162 @@ class CreateDialog(tk.Toplevel):
         self.destroy()
 
 
+def _fmt_time(sec: float) -> str:
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec}초"
+    if sec < 3600:
+        return f"{sec // 60}분 {sec % 60:02d}초"
+    return f"{sec // 3600}시간 {sec % 3600 // 60:02d}분"
+
+
+class ProgressDialog(tk.Toplevel):
+    """진행 창: 진행 막대, 속도 그래프, 경과/남은 시간, 속도, 일시 정지/취소.
+
+    작업이 금방 끝나면 창이 깜빡이지 않도록 0.3초 뒤에야 보여 준다.
+    """
+    W, H = 440, 120  # 그래프 크기
+
+    def __init__(self, master, title, progress):
+        super().__init__(master)
+        self.withdraw()
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(master)
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.p = progress
+        self.closed = False
+        self.samples = []      # 그래프 점: (진행 비율, 속도)
+        self.recent = deque()  # 최근 2초 (경과 시간, 처리한 바이트) → 현재 속도
+        self.peak = 1.0
+
+        frm = ttk.Frame(self, padding=14)
+        frm.pack(fill="both", expand=True)
+        top = ttk.Frame(frm)
+        top.pack(fill="x")
+        self.pct = ttk.Label(top, text="0%", font=("Segoe UI", 20, "bold"))
+        self.pct.pack(side="left")
+        self.state_lbl = ttk.Label(top, text="준비 중…", foreground="#555")
+        self.state_lbl.pack(side="left", padx=(12, 0), pady=(8, 0))
+        self.bar = ttk.Progressbar(frm, length=self.W, maximum=1000)
+        self.bar.pack(fill="x", pady=(6, 8))
+
+        self.graph = tk.Canvas(frm, width=self.W, height=self.H, bg="white",
+                               highlightthickness=1, highlightbackground="#c8c8c8")
+        self.graph.pack()
+
+        info = ttk.Frame(frm)
+        info.pack(fill="x", pady=(10, 0))
+        self.vals = {}
+        for i, key in enumerate(("경과 시간", "남은 시간", "속도", "처리한 크기", "파일")):
+            r, c = divmod(i, 2)
+            ttk.Label(info, text=key, foreground="#666").grid(row=r, column=c * 2, sticky="w", padx=(0, 10))
+            self.vals[key] = ttk.Label(info, text="-")
+            self.vals[key].grid(row=r, column=c * 2 + 1, sticky="w", padx=(0, 28))
+        self.name_lbl = ttk.Label(frm, text="", foreground="#555", width=60)
+        self.name_lbl.pack(fill="x", pady=(8, 0))
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(12, 0))
+        self.cancel_btn = ttk.Button(btns, text="취소", command=self.cancel)
+        self.cancel_btn.pack(side="right")
+        self.pause_btn = ttk.Button(btns, text="일시 정지", command=self.toggle_pause)
+        self.pause_btn.pack(side="right", padx=(0, 6))
+
+        self.after(300, self._show)
+        self.after(150, self.refresh)
+
+    def _show(self):
+        if not self.closed:
+            self.deiconify()
+            self.lift()
+
+    def toggle_pause(self):
+        if self.p.paused:
+            self.p.resume()
+            self.pause_btn.config(text="일시 정지")
+        else:
+            self.p.pause()
+            self.pause_btn.config(text="계속")
+        self.refresh(reschedule=False)
+
+    def cancel(self):
+        self.p.cancel()
+        self.state_lbl.config(text="취소하는 중…")
+        self.pause_btn.state(["disabled"])
+        self.cancel_btn.state(["disabled"])
+
+    def fraction(self) -> float:
+        p = self.p
+        if p.total_bytes:
+            return min(p.done_bytes / p.total_bytes, 1.0)
+        return p.done_items / p.total_items if p.total_items else 0.0
+
+    def refresh(self, reschedule=True):
+        if self.closed:
+            return
+        p = self.p
+        now, done = p.elapsed(), p.done_bytes
+        self.recent.append((now, done))
+        while len(self.recent) > 2 and now - self.recent[0][0] > 2.0:
+            self.recent.popleft()
+        t0, b0 = self.recent[0]
+        speed = (done - b0) / (now - t0) if now - t0 > 0.2 else 0.0
+        frac = self.fraction()
+
+        if not p.paused:
+            if self.samples and int(self.samples[-1][0] * self.W) == int(frac * self.W):
+                self.samples[-1] = (frac, speed)  # 같은 가로 위치면 마지막 점을 바꾼다
+            else:
+                self.samples.append((frac, speed))
+            self.peak = max(self.peak, speed)
+
+        self.pct.config(text=f"{frac * 100:.0f}%")
+        self.bar["value"] = frac * 1000
+        if p.cancelled:
+            pass
+        elif p.paused:
+            self.state_lbl.config(text="일시 정지됨")
+        else:
+            self.state_lbl.config(text="")
+        avg = done / now if now > 0 else 0
+        self.vals["경과 시간"].config(text=_fmt_time(now))
+        left = (p.total_bytes - done) / avg if avg and now > 1 else None
+        self.vals["남은 시간"].config(text=_fmt_time(left) if left is not None else "계산 중…")
+        self.vals["속도"].config(text="-" if p.paused else f"{core.human_size(int(speed))}/s")
+        self.vals["처리한 크기"].config(text=f"{core.human_size(done)} / {core.human_size(p.total_bytes)}")
+        self.vals["파일"].config(text=f"{p.done_items:,} / {p.total_items:,}")
+        self.name_lbl.config(text=p.name[-70:])
+        self._draw(speed)
+        if reschedule:
+            self.after(150, self.refresh)
+
+    def _draw(self, speed):
+        g, W, H = self.graph, self.W, self.H
+        g.delete("all")
+        for i in range(1, 4):  # 25% 간격 세로 눈금
+            g.create_line(W * i / 4, 0, W * i / 4, H, fill="#ececec")
+        top = self.peak * 1.15
+        y = lambda s: H - 2 - (H - 14) * s / top  # noqa: E731
+        if self.samples:
+            pts = [0, H]
+            for frac, s in self.samples:
+                pts += [frac * W, y(s)]
+            pts += [self.samples[-1][0] * W, H]
+            g.create_polygon(pts, fill="#cfeccd", outline="")
+            if len(self.samples) >= 2:
+                g.create_line(pts[2:-2], fill="#2e9e44", width=2)
+            cy = y(speed)
+            g.create_line(0, cy, W, cy, fill="#7a7a7a", dash=(3, 3))
+            label = f"속도: {core.human_size(int(speed))}/s"
+            g.create_text(W - 6, max(cy - 8, 8), text=label, anchor="e", fill="#444",
+                          font=("Segoe UI", 9))
+
+    def close(self):
+        self.closed = True
+        self.destroy()
+
+
 class App(tk.Tk):
     def __init__(self, open_path=None):
         super().__init__()
@@ -135,6 +293,7 @@ class App(tk.Tk):
         self.minsize(600, 320)
         self.archive = None
         self.busy = False
+        self.dialog = None  # 작업 중일 때 진행 창
         self.events = queue.Queue()
 
         self._build_menu()
@@ -361,7 +520,7 @@ class App(tk.Tk):
         def job(progress):
             n = core.extract(archive, dest, members, progress)
             return f"{n}개 항목을 풀었습니다 → {dest}", dest
-        self._start(job, "압축 푸는 중…")
+        self._start(job, "압축 푸는 중", archive)
 
     def test_archive(self):
         if not self._need_archive():
@@ -373,7 +532,7 @@ class App(tk.Tk):
             if bad:
                 raise core.ArchiveError("손상된 항목:\n" + "\n".join(bad[:20]))
             return "압축 파일에 이상이 없습니다.", None
-        self._start(job, "테스트 중…")
+        self._start(job, "테스트 중", archive)
 
     def new_archive(self, sources=None):
         if self.busy:
@@ -387,7 +546,7 @@ class App(tk.Tk):
         def job(progress):
             n = core.create(srcs, out, fmt, level, progress)
             return f"{n}개 항목을 압축했습니다 → {os.path.basename(out)}", ("open", out)
-        self._start(job, "압축하는 중…")
+        self._start(job, "압축하는 중", out)
 
     # ---------- 버전 / 업데이트 ----------
     def show_about(self):
@@ -423,23 +582,35 @@ class App(tk.Tk):
             webbrowser.open(info["download"] or info["url"])
 
     # ---------- 백그라운드 작업 ----------
-    def _start(self, job, label):
+    def _start(self, job, label, target):
         self.busy = True
         self.status.set(label)
         self.prog["value"] = 0
+        prog = Progress()
+        self.dialog = ProgressDialog(self, f"{label} - {os.path.basename(target)}", prog)
 
         events = self.events  # 작업 스레드가 창(self)을 붙잡지 않게 큐만 넘긴다
 
-        def progress(done, total, name):
-            events.put(("progress", done, total, name))
-
         def run():
             try:
-                msg, extra = job(progress)
+                msg, extra = job(prog)
+                # 결과 메시지에 걸린 시간과 평균 속도를 덧붙인다
+                secs = prog.elapsed()
+                msg += f"\n\n걸린 시간 {_fmt_time(secs) if secs >= 1 else f'{secs:.1f}초'}"
+                if secs > 0 and prog.done_bytes:
+                    msg += f" · 평균 {core.human_size(int(prog.done_bytes / secs))}/s"
                 events.put(("done", msg, extra))
+            except Cancelled:
+                events.put(("cancelled",))
             except Exception as e:  # 작업 스레드 오류를 UI로 전달
                 events.put(("error", str(e)))
         threading.Thread(target=run, daemon=True).start()
+
+    def _finish(self):
+        self.busy = False
+        if self.dialog:
+            self.dialog.close()
+            self.dialog = None
 
     def _poll(self):
         try:
@@ -450,29 +621,31 @@ class App(tk.Tk):
                 elif ev[0] == "update_error":
                     if not ev[2]:
                         messagebox.showwarning(APP, ev[1])
-                elif ev[0] == "progress":
-                    _, done, total, name = ev
-                    self.prog["maximum"] = max(total, 1)
-                    self.prog["value"] = done
-                    self.status.set(f"{done}/{total}  {name}")
                 elif ev[0] == "done":
-                    self.busy = False
+                    self._finish()
                     _, msg, extra = ev
-                    self.status.set(msg)
+                    self.prog["value"] = 100
+                    self.status.set(msg.splitlines()[0])
                     if isinstance(extra, tuple) and extra[0] == "open":
                         self.open_archive(extra[1])
-                        self.status.set(msg)
+                        self.status.set(msg.splitlines()[0])
                     elif extra and os.path.isdir(extra) and messagebox.askyesno(APP, msg + "\n\n폴더를 열까요?"):
                         os.startfile(extra)
                     elif not extra:
                         messagebox.showinfo(APP, msg)
+                elif ev[0] == "cancelled":
+                    self._finish()
+                    self.prog["value"] = 0
+                    self.status.set("작업을 취소했습니다.")
                 elif ev[0] == "error":
-                    self.busy = False
+                    self._finish()
                     self.prog["value"] = 0
                     self.status.set("오류")
                     messagebox.showerror(APP, ev[1])
         except queue.Empty:
             pass
+        if self.dialog:  # 아래 상태 줄의 막대도 같이 움직인다
+            self.prog["value"] = self.dialog.fraction() * 100
         self.after(50, self._poll)
 
 
