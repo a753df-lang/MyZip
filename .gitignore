@@ -1,0 +1,8 @@
+# 빌드 결과물: exe는 저장소가 아니라 GitHub Releases에 첨부한다
+dist/
+build/
+*.spec
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
