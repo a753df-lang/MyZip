@@ -11,7 +11,10 @@ if not exist "%VENV%\Scripts\python.exe" (
 )
 if not exist myzip.ico python make_icon.py
 
-"%VENV%\Scripts\python.exe" -m PyInstaller --noconfirm --onefile --windowed --name MyZip --icon "%CD%\myzip.ico" --workpath "%WORK%" --specpath "%WORK%" --distpath dist MyZip.pyw --log-level WARN || exit /b 1
-"%VENV%\Scripts\python.exe" -m PyInstaller --noconfirm --onefile --console --name myzip-cli --icon "%CD%\myzip.ico" --workpath "%WORK%" --specpath "%WORK%" --distpath dist myzip_cli.py --log-level WARN || exit /b 1
+rem ssl(OpenSSL)은 약 6MB라 넣지 않는다. 업데이트 확인은 Windows 기본 curl.exe로 한다 (myzip\update.py)
+set SLIM=--exclude-module ssl --exclude-module _ssl --exclude-module _hashlib
+
+"%VENV%\Scripts\python.exe" -m PyInstaller --noconfirm --onefile --windowed --name MyZip --icon "%CD%\myzip.ico" --workpath "%WORK%" --specpath "%WORK%" --distpath dist %SLIM% MyZip.pyw --log-level WARN || exit /b 1
+"%VENV%\Scripts\python.exe" -m PyInstaller --noconfirm --onefile --console --name myzip-cli --icon "%CD%\myzip.ico" --workpath "%WORK%" --specpath "%WORK%" --distpath dist %SLIM% myzip_cli.py --log-level WARN || exit /b 1
 echo.
 echo 빌드 완료: dist\MyZip.exe, dist\myzip-cli.exe
